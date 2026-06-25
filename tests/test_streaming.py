@@ -246,3 +246,65 @@ def make_event_iterator(
     return AsyncStream(
         cast_to=object, client=async_client, response=httpx.Response(200, content=to_aiter(content))
     )._iter_events()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sync", [True, False], ids=["sync", "async"])
+async def test_stream_drains_before_close(sync: bool, client: OpenAI, async_client: AsyncOpenAI) -> None:
+    """Regression test for https://github.com/openai/openai-python/issues/3440
+
+    After [DONE], the response stream should be fully drained (including the
+    chunked transfer-encoding terminator) before close() is called.
+    """
+    chunks = [
+        b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n',
+        b'data: [DONE]\n\n',
+    ]
+
+    if sync:
+        response = httpx.Response(200, content=iter(chunks))
+        stream = Stream(cast_to=object, client=client, response=response)
+        for _ in stream:
+            pass
+        assert response.is_stream_consumed
+    else:
+        response = httpx.Response(200, content=to_aiter(iter(chunks)))
+        stream = AsyncStream(cast_to=object, client=async_client, response=response)
+        async for _ in stream:
+            pass
+        assert response.is_stream_consumed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sync", [True, False], ids=["sync", "async"])
+async def test_stream_no_drain_on_error(sync: bool, client: OpenAI, async_client: AsyncOpenAI) -> None:
+    """When [DONE] is NOT seen (e.g. on error), the drain loop must NOT run,
+    as it could hang on a stalled stream. The response should be closed immediately."""
+
+    class StalledIterator:
+        """An iterator that would hang forever if drained."""
+        def __iter__(self):
+            return self
+        def __next__(self):
+            raise RuntimeError("Should not be called - stream should not be drained")
+
+    class AsyncStalledIterator:
+        def __aiter__(self):
+            return self
+        async def __anext__(self):
+            raise RuntimeError("Should not be called - stream should not be drained")
+
+    if sync:
+        response = httpx.Response(200, content=StalledIterator())
+        stream = Stream(cast_to=object, client=client, response=response)
+        with pytest.raises((StopIteration, RuntimeError)):
+            for _ in stream:
+                pass
+        assert response.is_closed
+    else:
+        response = httpx.Response(200, content=AsyncStalledIterator())
+        stream = AsyncStream(cast_to=object, client=async_client, response=response)
+        with pytest.raises((StopAsyncIteration, RuntimeError)):
+            async for _ in stream:
+                pass
+        assert response.is_closed
